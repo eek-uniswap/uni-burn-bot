@@ -54,7 +54,6 @@ export class EthereumMonitor {
   async scanBlocksForTransfers(startBlock: number, endBlock: number): Promise<TokenTransfer[]> {
     const matchingTransfers: TokenTransfer[] = [];
 
-    console.log(`Scanning blocks ${startBlock} to ${endBlock} for Transfer events`);
 
     try {
       // Get logs for Transfer events from the token contract

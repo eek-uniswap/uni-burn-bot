@@ -214,6 +214,8 @@ export class SlackService {
         channel: this.channel,
         blocks,
         text: 'New token transfer detected', // Fallback text
+        unfurl_links: false,
+        unfurl_media: false,
       });
 
       console.log(`Message sent to ${this.channel}: ${response.ts}`);
