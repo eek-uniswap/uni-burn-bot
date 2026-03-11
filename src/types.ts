@@ -10,6 +10,15 @@ export interface TokenTransfer {
   gasPrice?: bigint;
   status?: number;
   burnerAddress?: string; // The address that initiated the transaction (tx.from)
+  chain?: string; // 'mainnet' | 'unichain' | 'base' | 'optimism' | 'arbitrum'
+}
+
+export interface L2ChainConfig {
+  name: string;
+  rpcUrl: string;
+  firepitAddress: string;
+  uniTokenAddress: string;
+  secondsPerBlock: number;
 }
 
 export interface Config {
@@ -22,5 +31,6 @@ export interface Config {
   slackBotToken: string;
   slackChannel: string;
   pollInterval: number;
+  l2Chains: L2ChainConfig[];
 }
 

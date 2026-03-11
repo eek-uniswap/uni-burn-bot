@@ -5,36 +5,25 @@ export class SlackService {
   private client: WebClient;
   private channel: string;
   private tokenDecimals: number;
-  private monitoredAmounts: bigint[];
+  private monitoredAmounts: bigint[] = [];
 
-  constructor(botToken: string, channel: string, tokenDecimals: number = 18, monitoredAmounts: string[] = []) {
+  constructor(botToken: string, channel: string, tokenDecimals: number = 18) {
     this.client = new WebClient(botToken);
     this.channel = channel;
     this.tokenDecimals = tokenDecimals;
-    this.monitoredAmounts = monitoredAmounts.map(amount => BigInt(amount));
+    this.monitoredAmounts = [];
     console.log(`Slack service initialized for channel: ${this.channel}`);
   }
 
-  private getTransferSizeLabel(value: bigint): string {
-    // Check if it's a 2k transfer (2000 tokens)
-    const twoK = BigInt(2000) * BigInt(10 ** this.tokenDecimals);
-    // Check if it's a 4k transfer (4000 tokens)
-    const fourK = BigInt(4000) * BigInt(10 ** this.tokenDecimals);
-
-    if (value === twoK) {
-      return 'Unichain';
-    } else if (value === fourK) {
-      return 'Mainnet';
-    } else {
-      // For other amounts, format the number
-      const formatted = this.formatTokenAmount(value);
-      // Try to format nicely (e.g., "1" for 1 token, "100" for 100 tokens)
-      const num = parseFloat(formatted);
-      if (num >= 1000) {
-        return `${(num / 1000).toFixed(1)}k`.replace('.0k', 'k');
-      }
-      return formatted;
-    }
+  private getChainLabel(chain?: string): string {
+    const labels: Record<string, string> = {
+      mainnet: 'Mainnet',
+      unichain: 'Unichain',
+      base: 'Base',
+      optimism: 'Optimism',
+      arbitrum: 'Arbitrum',
+    };
+    return labels[chain ?? 'mainnet'] ?? (chain ?? 'Unknown');
   }
 
   private formatTokenAmount(value: bigint): string {
@@ -42,15 +31,15 @@ export class SlackService {
     const wholePart = value / divisor;
     const fractionalPart = value % divisor;
 
+    const wholeFormatted = Number(wholePart).toLocaleString('en-US');
+
     if (fractionalPart === BigInt(0)) {
-      return wholePart.toString();
+      return wholeFormatted;
     }
 
-    // Format fractional part with proper decimal places
     const fractionalStr = fractionalPart.toString().padStart(this.tokenDecimals, '0');
-    const trimmedFractional = fractionalStr.replace(/0+$/, ''); // Remove trailing zeros
-
-    return `${wholePart}.${trimmedFractional}`;
+    const trimmedFractional = fractionalStr.replace(/0+$/, '');
+    return `${wholeFormatted}.${trimmedFractional}`;
   }
 
   private formatTimeDifference(ms: number): string {
@@ -70,146 +59,35 @@ export class SlackService {
     }
   }
 
-  private generateChart(dailyData: Array<{ date: Date; movingAverageHours: number | null }>): string {
-    const chartWidth = 70;
-    const chartHeight = 15;
-    const yAxisWidth = 8;
-    const dataWidth = chartWidth - yAxisWidth;
-
-    if (dailyData.length === 0) {
-      return '```\nNo data available for chart\n```';
-    }
-
-    // Filter out null values but keep track of original indices
-    const validDataWithIndices = dailyData
-      .map((d, idx) => ({ ...d, originalIndex: idx }))
-      .filter(d => d.movingAverageHours !== null) as Array<{
-        date: Date;
-        movingAverageHours: number;
-        originalIndex: number
-      }>;
-
-    if (validDataWithIndices.length === 0) {
-      return '```\nNo data available for chart\n```';
-    }
-
-    // Find min and max values
-    const values = validDataWithIndices.map(d => d.movingAverageHours);
-    const minValue = Math.min(...values);
-    const maxValue = Math.max(...values);
-    const range = maxValue - minValue || 1; // Avoid division by zero
-
-    // Normalize values to chart height
-    const normalized = validDataWithIndices.map(d => ({
-      date: d.date,
-      value: Math.round(((d.movingAverageHours - minValue) / range) * (chartHeight - 1)),
-      original: d.movingAverageHours,
-      originalIndex: d.originalIndex
-    }));
-
-    // Create chart grid
-    const chart: string[][] = Array(chartHeight).fill(null).map(() => Array(chartWidth).fill(' '));
-
-    // Draw Y-axis labels and values (right-aligned)
-    for (let y = 0; y < chartHeight; y++) {
-      const value = maxValue - (range * y / (chartHeight - 1));
-      const label = value.toFixed(1) + 'h';
-      const labelStart = yAxisWidth - label.length - 1;
-
-      // Add value label
-      for (let i = 0; i < label.length; i++) {
-        if (labelStart + i >= 0) {
-          chart[y][labelStart + i] = label[i];
-        }
-      }
-      // Add Y-axis line
-      chart[y][yAxisWidth - 1] = '│';
-    }
-
-    // Draw data points as a line chart
-    // Map each point to X position based on its position in the data array
-    // The data array starts from the first transaction day, so indices are 0 to dataLength-1
-    const dataLength = dailyData.length;
-    if (normalized.length > 1) {
-      for (let i = 0; i < normalized.length - 1; i++) {
-        const point1 = normalized[i];
-        const point2 = normalized[i + 1];
-
-        // Calculate X position based on original index in dailyData array
-        // Use dataLength - 1 to avoid division by zero and get proper spacing
-        const x1 = yAxisWidth + Math.floor((point1.originalIndex / Math.max(1, dataLength - 1)) * dataWidth);
-        const y1 = chartHeight - 1 - point1.value;
-        const x2 = yAxisWidth + Math.floor((point2.originalIndex / Math.max(1, dataLength - 1)) * dataWidth);
-        const y2 = chartHeight - 1 - point2.value;
-
-        // Draw line between points
-        const steps = Math.max(Math.abs(x2 - x1), Math.abs(y2 - y1));
-        for (let step = 0; step <= steps; step++) {
-          const t = steps > 0 ? step / steps : 0;
-          const x = Math.round(x1 + (x2 - x1) * t);
-          const y = Math.round(y1 + (y2 - y1) * t);
-
-          if (x >= yAxisWidth && x < chartWidth && y >= 0 && y < chartHeight) {
-            chart[y][x] = '█';
-          }
-        }
-      }
-    } else if (normalized.length === 1) {
-      // Single point
-      const point = normalized[0];
-      const x = yAxisWidth + Math.floor((point.originalIndex / Math.max(1, dataLength - 1)) * dataWidth);
-      const y = chartHeight - 1 - point.value;
-      if (x >= yAxisWidth && x < chartWidth && y >= 0 && y < chartHeight) {
-        chart[y][x] = '█';
-      }
-    }
-
-    // Draw X-axis
-    const xAxisY = chartHeight - 1;
-    for (let x = yAxisWidth; x < chartWidth; x++) {
-      chart[xAxisY][x] = '─';
-    }
-    chart[xAxisY][yAxisWidth - 1] = '└';
-
-    // Add date labels at start, middle, and end
-    const dateLabels = [
-      dailyData[0]?.date || new Date(),
-      dailyData[Math.floor(dailyData.length / 2)]?.date || new Date(),
-      dailyData[dailyData.length - 1]?.date || new Date()
-    ].map(d => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }));
-
-    // Convert chart to string
-    const chartLines = chart.map(row => row.join(''));
-
-    // Add date labels on a separate line
-    const dateLabelSpacing = Math.floor(dataWidth / 2);
-    const dateLabelLine = ' '.repeat(yAxisWidth) +
-      dateLabels[0].padEnd(dateLabelSpacing) +
-      dateLabels[1].padEnd(dateLabelSpacing) +
-      dateLabels[2];
-
-    return '```\n' + chartLines.join('\n') + '\n' + dateLabelLine + '\n```';
+  private getExplorerUrl(chain?: string): string {
+    const explorers: Record<string, string> = {
+      mainnet: 'https://etherscan.io',
+      unichain: 'https://uniscan.xyz',
+      base: 'https://basescan.org',
+      optimism: 'https://optimistic.etherscan.io',
+      arbitrum: 'https://arbiscan.io',
+    };
+    return explorers[chain ?? 'mainnet'] ?? 'https://etherscan.io';
   }
 
   private formatTokenTransferMessage(
     transfer: TokenTransfer,
-    timeSinceLast: number | null,
     burnerCount: number,
     aggregateStats: {
       totalTokens: bigint;
-      totalTransactions: number;
-      averageTimeBetween: number | null;
+      currentMa7: number | null;
+      currentMa30: number | null;
       totalBurners: number;
       topBurners: Array<{ address: string; count: number }>;
-      daily7DayMA: Array<{ date: Date; movingAverageHours: number | null }>;
+      chainBreakdown: Array<{ chain: string; totalUNI: bigint; totalTransactions: number }>;
     }
   ): any[] {
-    const txUrl = `https://etherscan.io/tx/${transfer.hash}`;
+    const explorer = this.getExplorerUrl(transfer.chain);
+    const txUrl = `${explorer}/tx/${transfer.hash}`;
     const burnerAddress = transfer.burnerAddress || transfer.from;
-    const burnerUrl = `https://etherscan.io/address/${burnerAddress}`;
+    const burnerUrl = `${explorer}/address/${burnerAddress}`;
 
-    // Determine transfer size label (2k, 4k, etc.)
-    const transferSizeLabel = this.getTransferSizeLabel(transfer.value);
+    const chainLabel = this.getChainLabel(transfer.chain);
     const transferAmountFormatted = this.formatTokenAmount(transfer.value);
 
     // Build message blocks
@@ -218,7 +96,7 @@ export class SlackService {
         type: 'header',
         text: {
           type: 'plain_text',
-          text: ` :unicorn_face: :fire: ${transferSizeLabel} UNI Burn Detected`,
+          text: ` :unicorn_face: :fire: ${chainLabel} UNI Burn Detected`,
         },
       },
       {
@@ -236,7 +114,7 @@ export class SlackService {
         fields: [
           {
             type: 'mrkdwn',
-            text: `*Amount:*\n${transferAmountFormatted} UNI (${transferSizeLabel} transfer)`,
+            text: `*Amount:*\n${transferAmountFormatted} UNI (${chainLabel})`,
           },
           {
             type: 'mrkdwn',
@@ -249,17 +127,6 @@ export class SlackService {
         ],
       },
     ];
-
-    // Add time since last if available
-    if (timeSinceLast !== null && timeSinceLast !== undefined) {
-      blocks.push({
-        type: 'section',
-        text: {
-          type: 'mrkdwn',
-          text: `*Time Since Last Transaction:* ${this.formatTimeDifference(timeSinceLast)}`,
-        },
-      });
-    }
 
     // Add aggregate statistics
     blocks.push({
@@ -275,14 +142,8 @@ export class SlackService {
     });
 
     const totalTokensFormatted = this.formatTokenAmount(aggregateStats.totalTokens);
-
-    // Get the most recent 7-day moving average (last non-null value in the array)
-    const recent7DayMA = aggregateStats.daily7DayMA
-      .filter(d => d.movingAverageHours !== null)
-      .slice(-1)[0];
-
-    const avgTimeFormatted = recent7DayMA?.movingAverageHours !== null && recent7DayMA?.movingAverageHours !== undefined
-      ? this.formatTimeDifference(recent7DayMA.movingAverageHours * 1000 * 60 * 60) // Convert hours to milliseconds
+    const ma7Formatted = aggregateStats.currentMa7 !== null
+      ? `${Math.round(aggregateStats.currentMa7).toLocaleString('en-US')} UNI/day`
       : 'N/A';
 
     blocks.push({
@@ -290,30 +151,30 @@ export class SlackService {
       fields: [
         {
           type: 'mrkdwn',
-          text: `*Total Tokens Sent:*\n${totalTokensFormatted} tokens`,
+          text: `*Total UNI Burned:*\n${totalTokensFormatted} UNI`,
         },
         {
           type: 'mrkdwn',
-          text: `*Total Transactions:*\n${aggregateStats.totalTransactions.toLocaleString()}`,
+          text: `*7-Day MA:*\n${ma7Formatted}`,
         },
         {
           type: 'mrkdwn',
-          text: `*Average Time Between Burns (7-day moving average):*\n${avgTimeFormatted}`,
+          text: `*30-Day MA:*\n${aggregateStats.currentMa30 !== null ? `${Math.round(aggregateStats.currentMa30).toLocaleString('en-US')} UNI/day` : 'N/A'}`,
         },
         {
           type: 'mrkdwn',
-          text: `*Total Burners:*\n${aggregateStats.totalBurners.toLocaleString()}`,
+          text: `*Total Burners (${chainLabel}):*\n${aggregateStats.totalBurners.toLocaleString()}`,
         },
       ],
     });
 
-    // Add top 3 burners
+    // Add top 3 burners for this chain
     if (aggregateStats.topBurners.length > 0) {
       const topBurnersText = aggregateStats.topBurners
         .map((burner, index) => {
           const rankEmoji = index === 0 ? '🥇' : index === 1 ? '🥈' : '🥉';
-          const burnerUrl = `https://etherscan.io/address/${burner.address}`;
-          return `${rankEmoji} <${burnerUrl}|\`${burner.address.slice(0, 10)}...\`> - ${burner.count} transaction${burner.count !== 1 ? 's' : ''}`;
+          const burnerUrl = `${explorer}/address/${burner.address}`;
+          return `${rankEmoji} <${burnerUrl}|\`${burner.address.slice(0, 10)}...\`> - ${burner.count} burn${burner.count !== 1 ? 's' : ''}`;
         })
         .join('\n');
 
@@ -321,32 +182,28 @@ export class SlackService {
         type: 'section',
         text: {
           type: 'mrkdwn',
-          text: `*Top 3 Burners:*\n${topBurnersText}`,
+          text: `*Top 3 Burners (${chainLabel}):*\n${topBurnersText}`,
         },
       });
     }
 
-    // Add 7-day moving average chart
-    blocks.push({
-      type: 'divider',
-    });
+    // Add per-chain breakdown
+    if (aggregateStats.chainBreakdown.length > 1) {
+      const breakdownText = aggregateStats.chainBreakdown
+        .map(({ chain, totalUNI, totalTransactions }) => {
+          const uni = this.formatTokenAmount(totalUNI);
+          return `*${this.getChainLabel(chain)}:* ${uni} UNI (${totalTransactions.toLocaleString()} burns)`;
+        })
+        .join('\n');
 
-    blocks.push({
-      type: 'section',
-      text: {
-        type: 'mrkdwn',
-        text: '*📈 7-Day Moving Average of Time Between Transactions (Last 30 Days)*',
-      },
-    });
-
-    const chart = this.generateChart(aggregateStats.daily7DayMA);
-    blocks.push({
-      type: 'section',
-      text: {
-        type: 'mrkdwn',
-        text: chart,
-      },
-    });
+      blocks.push({
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `*🌐 By Chain:*\n${breakdownText}`,
+        },
+      });
+    }
 
     return blocks;
   }
@@ -380,18 +237,17 @@ export class SlackService {
 
   async sendTransferAlert(
     transfer: TokenTransfer,
-    timeSinceLast: number | null,
     burnerCount: number,
     aggregateStats: {
       totalTokens: bigint;
-      totalTransactions: number;
-      averageTimeBetween: number | null;
+      currentMa7: number | null;
+      currentMa30: number | null;
       totalBurners: number;
       topBurners: Array<{ address: string; count: number }>;
-      daily7DayMA: Array<{ date: Date; movingAverageHours: number | null }>;
+      chainBreakdown: Array<{ chain: string; totalUNI: bigint; totalTransactions: number }>;
     }
   ): Promise<void> {
-    const blocks = this.formatTokenTransferMessage(transfer, timeSinceLast, burnerCount, aggregateStats);
+    const blocks = this.formatTokenTransferMessage(transfer, burnerCount, aggregateStats);
     await this.sendMessage(blocks);
   }
 

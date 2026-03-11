@@ -19,7 +19,7 @@ describe('SlackService', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    slackService = new SlackService(mockBotToken, mockChannel, 18);
+    slackService = new SlackService(mockBotToken, mockChannel);
   });
 
   describe('formatTokenAmount', () => {
@@ -37,21 +37,20 @@ describe('SlackService', () => {
 
       const blocks = (service as any).formatTokenTransferMessage(
         transfer,
-        null,
         1,
         {
           totalTokens: BigInt('1000000000000000000'),
-          totalTransactions: 1,
-          averageTimeBetween: null,
+          currentMa7: null,
+          currentMa30: null,
           totalBurners: 1,
           topBurners: [],
-          daily7DayMA: [],
+          chainBreakdown: [],
         }
       );
 
       // Check that amount is formatted (should be "1" or "1.0")
       const amountSection = blocks.find((b: any) =>
-        b.fields?.some((f: any) => f.text?.includes('Total Tokens Sent'))
+        b.fields?.some((f: any) => f.text?.includes('Total UNI Burned'))
       );
       expect(amountSection).toBeDefined();
     });
@@ -99,14 +98,14 @@ describe('SlackService', () => {
 
       const aggregateStats = {
         totalTokens: BigInt('4000000000000000000000'),
-        totalTransactions: 1,
-        averageTimeBetween: null,
+        currentMa7: null,
+        currentMa30: null,
         totalBurners: 1,
         topBurners: [{ address: '0xburner', count: 1 }],
-        daily7DayMA: [],
+        chainBreakdown: [],
       };
 
-      await slackService.sendTransferAlert(transfer, null, 1, aggregateStats);
+      await slackService.sendTransferAlert(transfer, 1, aggregateStats);
 
       expect(mockPostMessage).toHaveBeenCalledWith(
         expect.objectContaining({

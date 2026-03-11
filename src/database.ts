@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import { TokenTransfer } from './types';
 
 // Current schema version - increment this when making schema changes
-const CURRENT_SCHEMA_VERSION = 2;
+const CURRENT_SCHEMA_VERSION = 3;
 
 type MigrationFunction = (db: Database.Database) => void;
 
@@ -87,9 +87,28 @@ export class TransactionDatabase {
       console.log('Migration 1 completed');
     });
 
-    // Future migrations can be added here:
-    // migrations.set(2, (db) => { ... });
-    // migrations.set(3, (db) => { ... });
+    // Migration 3: Add chain column, label existing Unichain burns (2000 UNI) accordingly
+    migrations.set(3, (db: Database.Database) => {
+      console.log('Running migration 3: add chain column');
+      // Table may not exist yet on a fresh install — it will be created with the column included
+      const tableExists = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='token_transfers'"
+      ).get();
+      if (!tableExists) {
+        console.log('Migration 3: table not yet created, skipping (column included in CREATE TABLE)');
+        return;
+      }
+      // Column may already exist if migration was partially applied
+      const tableInfo = db.prepare('PRAGMA table_info(token_transfers)').all() as Array<{ name: string }>;
+      if (tableInfo.some(col => col.name === 'chain')) {
+        console.log('Migration 3: chain column already exists, skipping');
+        return;
+      }
+      db.exec(`ALTER TABLE token_transfers ADD COLUMN chain TEXT NOT NULL DEFAULT 'mainnet'`);
+      // Records with value = 2000 * 10^18 were Unichain burns detected via L1 bridge
+      db.exec(`UPDATE token_transfers SET chain = 'unichain' WHERE value = '2000000000000000000000'`);
+      console.log('Migration 3 completed');
+    });
 
     return migrations;
   }
@@ -137,6 +156,7 @@ export class TransactionDatabase {
         timestamp TEXT NOT NULL,
         gas_used INTEGER,
         gas_price TEXT,
+        chain TEXT NOT NULL DEFAULT 'mainnet',
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
       );
 
@@ -161,10 +181,10 @@ export class TransactionDatabase {
 
   addTransfer(transfer: TokenTransfer): void {
     const stmt = this.db.prepare(`
-      INSERT INTO token_transfers (
+      INSERT OR IGNORE INTO token_transfers (
         tx_hash, block_number, token_address, from_address, to_address, burner_address,
-        value, timestamp, gas_used, gas_price
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        value, timestamp, gas_used, gas_price, chain
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     stmt.run(
@@ -177,7 +197,8 @@ export class TransactionDatabase {
       transfer.value.toString(),
       transfer.timestamp.toISOString(),
       transfer.gasUsed || null,
-      transfer.gasPrice?.toString() || null
+      transfer.gasPrice?.toString() || null,
+      transfer.chain || 'mainnet'
     );
   }
 
@@ -339,28 +360,28 @@ export class TransactionDatabase {
     return total;
   }
 
-  getTopBurners(limit: number = 3): Array<{ address: string; count: number }> {
-    const stmt = this.db.prepare(`
-      SELECT
-        burner_address as address,
-        COUNT(*) as count
-      FROM token_transfers
-      WHERE burner_address IS NOT NULL
-      GROUP BY burner_address
-      ORDER BY count DESC
-      LIMIT ?
-    `);
-    const rows = stmt.all(limit) as Array<{ address: string; count: number }>;
-    return rows;
+  getTopBurners(limit: number = 3, chain?: string): Array<{ address: string; count: number }> {
+    const stmt = chain
+      ? this.db.prepare(`
+          SELECT burner_address as address, COUNT(*) as count
+          FROM token_transfers
+          WHERE burner_address IS NOT NULL AND chain = ?
+          GROUP BY burner_address ORDER BY count DESC LIMIT ?
+        `)
+      : this.db.prepare(`
+          SELECT burner_address as address, COUNT(*) as count
+          FROM token_transfers
+          WHERE burner_address IS NOT NULL
+          GROUP BY burner_address ORDER BY count DESC LIMIT ?
+        `);
+    return (chain ? stmt.all(chain, limit) : stmt.all(limit)) as Array<{ address: string; count: number }>;
   }
 
-  getTotalBurners(): number {
-    const stmt = this.db.prepare(`
-      SELECT COUNT(DISTINCT burner_address) as total
-      FROM token_transfers
-      WHERE burner_address IS NOT NULL
-    `);
-    const result = stmt.get() as { total: number };
+  getTotalBurners(chain?: string): number {
+    const stmt = chain
+      ? this.db.prepare(`SELECT COUNT(DISTINCT burner_address) as total FROM token_transfers WHERE burner_address IS NOT NULL AND chain = ?`)
+      : this.db.prepare(`SELECT COUNT(DISTINCT burner_address) as total FROM token_transfers WHERE burner_address IS NOT NULL`);
+    const result = (chain ? stmt.get(chain) : stmt.get()) as { total: number };
     return result.total;
   }
 
@@ -472,6 +493,99 @@ export class TransactionDatabase {
     }
 
     return dailyData;
+  }
+
+  getTransferCountByChain(chain: string): number {
+    const stmt = this.db.prepare('SELECT COUNT(*) as count FROM token_transfers WHERE chain = ?');
+    const result = stmt.get(chain) as { count: number };
+    return result.count;
+  }
+
+  getChainBreakdown(): Array<{ chain: string; totalUNI: bigint; totalTransactions: number }> {
+    const stmt = this.db.prepare(`
+      SELECT chain, value
+      FROM token_transfers
+      ORDER BY chain
+    `);
+    const rows = stmt.all() as Array<{ chain: string; value: string }>;
+
+    const breakdown = new Map<string, { totalUNI: bigint; totalTransactions: number }>();
+    for (const row of rows) {
+      const entry = breakdown.get(row.chain) || { totalUNI: BigInt(0), totalTransactions: 0 };
+      entry.totalUNI += BigInt(row.value);
+      entry.totalTransactions += 1;
+      breakdown.set(row.chain, entry);
+    }
+
+    return Array.from(breakdown.entries())
+      .map(([chain, stats]) => ({ chain, ...stats }))
+      .sort((a, b) => Number(b.totalUNI - a.totalUNI));
+  }
+
+  /**
+   * Get daily 7-day and 30-day moving averages of UNI burnt per day.
+   * Returns the last chartDays days (or fewer if less history exists).
+   */
+  getDailyBurnMovingAverages(tokenDecimals: number = 18, chartDays: number = 30): Array<{ date: Date; ma7: number | null; ma30: number | null }> {
+    const divisor = BigInt(10 ** tokenDecimals);
+
+    const stmt = this.db.prepare(`
+      SELECT timestamp, value
+      FROM token_transfers
+      ORDER BY timestamp ASC
+    `);
+    const rows = stmt.all() as Array<{ timestamp: string; value: string }>;
+
+    if (rows.length === 0) return [];
+
+    // Build a map of YYYY-MM-DD -> total UNI burnt (integer tokens)
+    const dailySums = new Map<string, number>();
+    let firstDateKey: string | null = null;
+
+    for (const row of rows) {
+      const dateKey = new Date(row.timestamp).toISOString().slice(0, 10);
+      if (!firstDateKey) firstDateKey = dateKey;
+      const uniAmount = Number(BigInt(row.value) / divisor);
+      dailySums.set(dateKey, (dailySums.get(dateKey) || 0) + uniAmount);
+    }
+
+    if (!firstDateKey) return [];
+
+    // Build array of every day from first transaction to today (UTC noon to avoid DST issues)
+    const allDays: Array<{ dateKey: string; uni: number }> = [];
+    const curDate = new Date(firstDateKey + 'T12:00:00Z');
+    const todayUTC = new Date();
+    todayUTC.setUTCHours(12, 0, 0, 0);
+
+    while (curDate <= todayUTC) {
+      const dateKey = curDate.toISOString().slice(0, 10);
+      allDays.push({ dateKey, uni: dailySums.get(dateKey) || 0 });
+      curDate.setUTCDate(curDate.getUTCDate() + 1);
+    }
+
+    // Return the last chartDays days with their MAs
+    const chartStartIdx = Math.max(0, allDays.length - chartDays);
+    const result: Array<{ date: Date; ma7: number | null; ma30: number | null }> = [];
+
+    for (let i = chartStartIdx; i < allDays.length; i++) {
+      const date = new Date(allDays[i].dateKey + 'T12:00:00Z');
+
+      let ma7: number | null = null;
+      if (i >= 6) {
+        const slice = allDays.slice(i - 6, i + 1);
+        ma7 = slice.reduce((sum, d) => sum + d.uni, 0) / 7;
+      }
+
+      let ma30: number | null = null;
+      if (i >= 29) {
+        const slice = allDays.slice(i - 29, i + 1);
+        ma30 = slice.reduce((sum, d) => sum + d.uni, 0) / 30;
+      }
+
+      result.push({ date, ma7, ma30 });
+    }
+
+    return result;
   }
 
   close(): void {

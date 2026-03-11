@@ -26,14 +26,14 @@ describe('EthereumMonitor', () => {
   const mockRpcUrl = 'https://mainnet.infura.io/v3/test';
   const mockTokenAddress = '0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984';
   const mockRecipientAddress = '0x000000000000000000000000000000000000dEaD';
-  const mockAmount = '4000000000000000000000';
+  const mockAmounts = ['4000000000000000000000'];
 
   beforeEach(() => {
     monitor = new EthereumMonitor(
       mockRpcUrl,
       mockTokenAddress,
       mockRecipientAddress,
-      mockAmount
+      mockAmounts
     );
   });
 

@@ -2,8 +2,37 @@ import * as dotenv from 'dotenv';
 import * as path from 'path';
 import { TransactionDatabase } from './database';
 import { EthereumMonitor } from './ethereumMonitor';
+import { L2BurnMonitor } from './l2BurnMonitor';
 import { SlackService } from './slackService';
-import { Config } from './types';
+import { Config, L2ChainConfig } from './types';
+
+// Hardcoded L2 chain configs — RPC URLs come from env vars, contract addresses are fixed
+const L2_CHAIN_CONFIGS: Omit<L2ChainConfig, 'rpcUrl'>[] = [
+  {
+    name: 'unichain',
+    firepitAddress: '0xe0A780E9105aC10Ee304448224Eb4A2b11A77eeB',
+    uniTokenAddress: '0x8f187aA05619a017077f5308904739877ce9eA21',
+    secondsPerBlock: 1,
+  },
+  {
+    name: 'base',
+    firepitAddress: '0xff77c0ed0b6b13a20446969107e5867abc46f53a',
+    uniTokenAddress: '0xc3De830EA07524a0761646a6a4e4be0e114a3C83',
+    secondsPerBlock: 2,
+  },
+  {
+    name: 'optimism',
+    firepitAddress: '0x94460443ca27ffc1baeca61165fde18346c91abd',
+    uniTokenAddress: '0x6fd9d7AD17242c41f7131d257212c54A0e816691',
+    secondsPerBlock: 2,
+  },
+  {
+    name: 'arbitrum',
+    firepitAddress: '0xb8018422bce25d82e70cb98fda96a4f502d89427',
+    uniTokenAddress: '0xFa7F8980b0f1E64A2062791cc3b0871572f1F7f0',
+    secondsPerBlock: 0.25,
+  },
+];
 
 // Load .env file from project root (works with both ts-node and compiled JS)
 dotenv.config({ path: path.resolve(process.cwd(), '.env') });
@@ -15,7 +44,7 @@ function loadConfig(): Config {
   const amount = process.env.AMOUNT?.trim();
   const tokenDecimals = process.env.TOKEN_DECIMALS ? parseInt(process.env.TOKEN_DECIMALS.trim(), 10) : 18;
   const slackBotToken = process.env.SLACK_BOT_TOKEN?.trim();
-  const slackChannel = process.env.SLACK_CHANNEL?.trim();
+  const slackChannel = process.env.SLACK_CHANNEL?.trim().replace(/^#+/, '#');
   const pollInterval = parseInt(process.env.POLL_INTERVAL?.trim() || '30', 10);
 
   if (!ethereumRpcUrl || !tokenAddress || !recipientAddress || !amount || !slackBotToken || !slackChannel) {
@@ -24,26 +53,38 @@ function loadConfig(): Config {
     process.exit(1);
   }
 
-  // Build amounts array: start with the primary amount, then add any additional amounts
-  const amounts: string[] = [amount];
+  // Build L2 chain configs from env vars — only include chains with an RPC URL configured
+  const l2RpcEnvVars: Record<string, string> = {
+    unichain: 'UNICHAIN_RPC_URL',
+    base: 'BASE_RPC_URL',
+    optimism: 'OPTIMISM_RPC_URL',
+    arbitrum: 'ARBITRUM_RPC_URL',
+  };
 
-  // Support ADDITIONAL_AMOUNTS (comma-separated) for multiple amounts
-  const additionalAmounts = process.env.ADDITIONAL_AMOUNTS?.trim();
-  if (additionalAmounts) {
-    const additional = additionalAmounts.split(',').map(a => a.trim()).filter(a => a.length > 0);
-    amounts.push(...additional);
+  const l2Chains: L2ChainConfig[] = L2_CHAIN_CONFIGS
+    .map(cfg => {
+      const rpcUrl = process.env[l2RpcEnvVars[cfg.name]]?.trim();
+      return rpcUrl ? { ...cfg, rpcUrl } : null;
+    })
+    .filter((cfg): cfg is L2ChainConfig => cfg !== null);
+
+  if (l2Chains.length > 0) {
+    console.log(`L2 chains configured: ${l2Chains.map(c => c.name).join(', ')}`);
+  } else {
+    console.log('No L2 chains configured. Set UNICHAIN_RPC_URL, BASE_RPC_URL, OPTIMISM_RPC_URL, ARBITRUM_RPC_URL to enable L2 monitoring.');
   }
 
   return {
     ethereumRpcUrl,
     tokenAddress,
     recipientAddress,
-    amount, // Keep for backward compatibility
-    amounts, // Array of all amounts to monitor
+    amount,
+    amounts: [amount], // Mainnet only — L2 chains handled by L2BurnMonitor
     tokenDecimals,
     slackBotToken,
     slackChannel,
     pollInterval,
+    l2Chains,
   };
 }
 
@@ -53,10 +94,12 @@ async function main(): Promise<void> {
   // Initialize services
   let db: TransactionDatabase;
   let monitor: EthereumMonitor;
+  let l2Monitors: L2BurnMonitor[];
   let slack: SlackService;
 
   try {
-    db = new TransactionDatabase();
+    const dbPath = process.env.DATABASE_PATH || 'transactions.db';
+    db = new TransactionDatabase(dbPath);
     monitor = new EthereumMonitor(
       config.ethereumRpcUrl,
       config.tokenAddress,
@@ -64,7 +107,11 @@ async function main(): Promise<void> {
       config.amounts
     );
     await monitor.initialize();
-    slack = new SlackService(config.slackBotToken, config.slackChannel, config.tokenDecimals, config.amounts);
+
+    l2Monitors = config.l2Chains.map(chainCfg => new L2BurnMonitor(chainCfg));
+    await Promise.all(l2Monitors.map(m => m.initialize()));
+
+    slack = new SlackService(config.slackBotToken, config.slackChannel, config.tokenDecimals);
   } catch (error: any) {
     console.error(`Failed to initialize services:`, error.message);
     process.exit(1);
@@ -73,88 +120,73 @@ async function main(): Promise<void> {
   console.log('Bot started. Monitoring for token transfers...');
   console.log(`Polling interval: ${config.pollInterval} seconds`);
 
-  // Check if this is first run (database is empty)
-  const isFirstRun = db.getTransferCount(config.tokenAddress, config.recipientAddress) === 0;
+  // Helper: build aggregate stats and send Slack alert for a transfer
+  async function processTransfer(transfer: import('./types').TokenTransfer): Promise<void> {
+    db.addTransfer(transfer);
+    console.log(`Stored transfer: ${transfer.hash} (${transfer.chain ?? 'mainnet'})`);
 
-  if (isFirstRun) {
-    // Start date: December 27, 2025 at noon EST (17:00 UTC)
-    const startDate = new Date('2025-12-27T17:00:00Z');
-    console.log(`First run detected. Fetching transfers from ${startDate.toISOString()}...`);
+    const burnerAddress = transfer.burnerAddress || transfer.from;
+    const burnerStats = db.getBurnerStats(burnerAddress);
+
+    const chain = transfer.chain ?? 'mainnet';
+    const maData = db.getDailyBurnMovingAverages(config.tokenDecimals, 30);
+    const currentMa7 = maData.filter(d => d.ma7 !== null).slice(-1)[0]?.ma7 ?? null;
+    const currentMa30 = maData.filter(d => d.ma30 !== null).slice(-1)[0]?.ma30 ?? null;
+
+    const aggregateStats = {
+      totalTokens: db.getTotalTokensSent(),
+      currentMa7,
+      currentMa30,
+      totalBurners: db.getTotalBurners(chain),
+      topBurners: db.getTopBurners(3, chain),
+      chainBreakdown: db.getChainBreakdown(),
+    };
 
     try {
-      const historicalTransfers = await monitor.getHistoricalTransfers(startDate);
-      console.log(`Found ${historicalTransfers.length} historical transfer(s) since ${startDate.toISOString()}`);
-
-      // Store all historical transfers in database
-      for (const transfer of historicalTransfers) {
-        if (!db.transferExists(transfer.hash)) {
-          db.addTransfer(transfer);
-        }
-      }
-
-      // If we found transfers, send a message with the most recent one and aggregate stats
-      if (historicalTransfers.length > 0) {
-        // Sort by timestamp to get the most recent
-        const sortedTransfers = [...historicalTransfers].sort(
-          (a, b) => b.timestamp.getTime() - a.timestamp.getTime()
-        );
-        const mostRecentTransfer = sortedTransfers[0];
-
-        // Get time since last transfer (second most recent)
-        const timeSinceLast = sortedTransfers.length > 1
-          ? mostRecentTransfer.timestamp.getTime() - sortedTransfers[1].timestamp.getTime()
-          : null;
-
-        // Get burner stats for this specific burner
-        const burnerAddress = mostRecentTransfer.burnerAddress || mostRecentTransfer.from;
-        const burnerStats = db.getBurnerStats(burnerAddress);
-        const burnerCount = burnerStats.count;
-
-        // Get aggregate statistics
-        const totalTokens = db.getTotalTokensSent();
-        const totalTransactions = db.getTransferCount(config.tokenAddress, config.recipientAddress);
-        const averageTimeBetween = db.getAverageTimeBetweenTransfers();
-        const totalBurners = db.getTotalBurners();
-        const topBurners = db.getTopBurners(3);
-        const daily7DayMA = db.getDaily7DayMovingAverage(30);
-
-        const aggregateStats = {
-          totalTokens,
-          totalTransactions,
-          averageTimeBetween,
-          totalBurners,
-          topBurners,
-          daily7DayMA,
-        };
-
-        // Send message with new format
-        await slack.sendTransferAlert(mostRecentTransfer, timeSinceLast, burnerCount, aggregateStats);
-        console.log('Sent historical summary to Slack');
-      } else {
-        // No transfers found
-        const blocks = [
-          {
-            type: 'header',
-            text: {
-              type: 'plain_text',
-              text: '🤖 Bot Started - No Historical Transfers',
-            },
-          },
-          {
-            type: 'section',
-            text: {
-              type: 'mrkdwn',
-              text: 'Bot is now monitoring. No matching transfers found since December 27, 2025.',
-            },
-          },
-        ];
-        await slack.sendMessage(blocks);
-        console.log('Sent empty historical summary to Slack');
-      }
+      await slack.sendTransferAlert(transfer, burnerStats.count, aggregateStats);
+      console.log(`Sent alert for transfer: ${transfer.hash}`);
     } catch (error: any) {
-      console.error(`Error fetching/sending historical transfers:`, error.message);
+      console.error(`Failed to send Slack alert:`, error.message);
     }
   }
+
+  // Per-chain historical backfill — only runs if a chain has no records yet
+  const chainStartDates: Record<string, Date> = {
+    mainnet:  new Date('2025-12-27T17:00:00Z'),
+    unichain: new Date('2025-12-27T17:00:00Z'),
+    base:     new Date('2026-03-07T00:00:00Z'),
+    optimism: new Date('2026-03-07T00:00:00Z'),
+    arbitrum: new Date('2026-03-07T00:00:00Z'),
+  };
+
+  const backfillChain = async (
+    chainName: string,
+    getHistorical: (startDate: Date) => Promise<import('./types').TokenTransfer[]>
+  ) => {
+    const existingCount = db.getTransferCountByChain(chainName);
+    if (existingCount > 0) return;
+
+    const startDate = chainStartDates[chainName] ?? new Date('2026-03-07T00:00:00Z');
+    console.log(`[${chainName}] No records found — backfilling from ${startDate.toISOString()}...`);
+    try {
+      const transfers = await getHistorical(startDate);
+      console.log(`[${chainName}] Found ${transfers.length} historical transfer(s)`);
+      for (const t of transfers) {
+        if (!db.transferExists(t.hash)) db.addTransfer(t);
+      }
+      if (transfers.length > 0) {
+        const mostRecent = transfers.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime())[0];
+        await processTransfer(mostRecent);
+      }
+    } catch (error: any) {
+      console.error(`[${chainName}] Error during backfill:`, error.message);
+    }
+  };
+
+  await Promise.all([
+    backfillChain('mainnet', (d) => monitor.getHistoricalTransfers(d)),
+    ...l2Monitors.map(m => backfillChain(m.chainName, (d) => m.getHistoricalTransfers(d))),
+  ]);
 
   // Graceful shutdown handler
   const shutdown = () => {
@@ -166,69 +198,28 @@ async function main(): Promise<void> {
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
-  // Main monitoring loop
+  // Main monitoring loop — poll all chains in parallel each interval
   while (true) {
     try {
-      // Check for new transfers
-      const newTransfers = await monitor.checkForNewTransfers();
+      const allNewTransfers = (await Promise.all([
+        monitor.checkForNewTransfers(),
+        ...l2Monitors.map(m => m.checkForNewTransfers()),
+      ])).flat();
 
-      if (newTransfers.length > 0) {
-        console.log(`Found ${newTransfers.length} new transfer(s)`);
-
-        for (const transfer of newTransfers) {
-          // Check if we've already seen this transfer
+      if (allNewTransfers.length > 0) {
+        console.log(`Found ${allNewTransfers.length} new transfer(s) across all chains`);
+        for (const transfer of allNewTransfers) {
           if (!db.transferExists(transfer.hash)) {
-            // Store transfer in database first
-            db.addTransfer(transfer);
-            console.log(`Stored transfer: ${transfer.hash}`);
-
-            // Get time since last transfer
-            const previousTransferTimestamp = db.getPreviousTransferTimestamp(transfer.hash, transfer.timestamp);
-            const timeSinceLast = previousTransferTimestamp
-              ? transfer.timestamp.getTime() - previousTransferTimestamp.getTime()
-              : null;
-
-            // Get burner stats for this specific burner
-            const burnerAddress = transfer.burnerAddress || transfer.from;
-            const burnerStats = db.getBurnerStats(burnerAddress);
-            const burnerCount = burnerStats.count;
-
-            // Get aggregate statistics
-            const totalTokens = db.getTotalTokensSent();
-            const totalTransactions = db.getTransferCount(config.tokenAddress, config.recipientAddress);
-            const averageTimeBetween = db.getAverageTimeBetweenTransfers();
-            const totalBurners = db.getTotalBurners();
-            const topBurners = db.getTopBurners(3);
-            const daily7DayMA = db.getDaily7DayMovingAverage(30);
-
-            const aggregateStats = {
-              totalTokens,
-              totalTransactions,
-              averageTimeBetween,
-              totalBurners,
-              topBurners,
-              daily7DayMA,
-            };
-
-            // Send Slack alert
-            try {
-              await slack.sendTransferAlert(transfer, timeSinceLast, burnerCount, aggregateStats);
-              console.log(`Sent alert for transfer: ${transfer.hash}`);
-            } catch (error: any) {
-              console.error(`Failed to send Slack alert:`, error.message);
-            }
+            await processTransfer(transfer);
           } else {
             console.log(`Transfer already exists: ${transfer.hash}`);
           }
         }
-      } else {
-        console.log('No new transfers found');
       }
     } catch (error: any) {
       console.error(`Error in monitoring loop:`, error.message);
     }
 
-    // Wait before next check
     await new Promise((resolve) => setTimeout(resolve, config.pollInterval * 1000));
   }
 }
