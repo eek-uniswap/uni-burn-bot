@@ -588,6 +588,28 @@ export class TransactionDatabase {
     return result;
   }
 
+  getTransfersSince(since: Date): TokenTransfer[] {
+    const stmt = this.db.prepare(`
+      SELECT * FROM token_transfers
+      WHERE timestamp >= ?
+      ORDER BY timestamp ASC
+    `);
+    const rows = stmt.all(since.toISOString()) as any[];
+    return rows.map(row => ({
+      hash: row.tx_hash,
+      blockNumber: row.block_number,
+      tokenAddress: row.token_address,
+      from: row.from_address,
+      to: row.to_address,
+      value: BigInt(row.value),
+      timestamp: new Date(row.timestamp),
+      gasUsed: row.gas_used,
+      gasPrice: row.gas_price ? BigInt(row.gas_price) : undefined,
+      burnerAddress: row.burner_address,
+      chain: row.chain,
+    }));
+  }
+
   close(): void {
     this.db.close();
   }

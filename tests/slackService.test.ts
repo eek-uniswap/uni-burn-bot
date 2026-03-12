@@ -25,34 +25,34 @@ describe('SlackService', () => {
   describe('formatTokenAmount', () => {
     it('should format token amount with 18 decimals', () => {
       const service = new SlackService(mockBotToken, mockChannel, 18);
-      const transfer: TokenTransfer = {
-        hash: '0x123',
-        blockNumber: 1000,
-        tokenAddress: '0xtoken',
-        from: '0xfrom',
-        to: '0xto',
-        value: BigInt('1000000000000000000'), // 1 token
-        timestamp: new Date(),
-      };
+      const burns: TokenTransfer[] = [
+        {
+          hash: '0x123',
+          blockNumber: 1000,
+          tokenAddress: '0xtoken',
+          from: '0xfrom',
+          to: '0xto',
+          value: BigInt('1000000000000000000'), // 1 token
+          timestamp: new Date(),
+        },
+      ];
 
-      const blocks = (service as any).formatTokenTransferMessage(
-        transfer,
-        1,
+      const blocks = (service as any).formatDigestBlocks(
+        new Date('2025-01-01T00:00:00Z'),
+        new Date('2025-01-01T04:00:00Z'),
+        burns,
         {
           totalTokens: BigInt('1000000000000000000'),
           currentMa7: null,
           currentMa30: null,
-          totalBurners: 1,
-          topBurners: [],
           chainBreakdown: [],
         }
       );
 
-      // Check that amount is formatted (should be "1" or "1.0")
-      const amountSection = blocks.find((b: any) =>
-        b.fields?.some((f: any) => f.text?.includes('Total UNI Burned'))
-      );
-      expect(amountSection).toBeDefined();
+      // Check that total burned amount appears in the blocks
+      const allText = JSON.stringify(blocks);
+      expect(allText).toContain('Total Burned');
+      expect(allText).toContain('1 UNI');
     });
   });
 
@@ -82,38 +82,86 @@ describe('SlackService', () => {
     });
   });
 
-  describe('sendTransferAlert', () => {
-    it('should send a message with correct format', async () => {
-      const transfer: TokenTransfer = {
-        hash: '0xabc123',
-        blockNumber: 1000,
-        tokenAddress: '0xtoken',
-        from: '0xfrom',
-        to: '0xto',
-        value: BigInt('4000000000000000000000'),
-        timestamp: new Date('2025-01-01T00:00:00Z'),
-        burnerAddress: '0xburner',
-        status: 1,
-      };
+  describe('sendDigest', () => {
+    const windowStart = new Date('2025-01-01T00:00:00Z');
+    const windowEnd = new Date('2025-01-01T04:00:00Z');
 
-      const aggregateStats = {
-        totalTokens: BigInt('4000000000000000000000'),
-        currentMa7: null,
-        currentMa30: null,
-        totalBurners: 1,
-        topBurners: [{ address: '0xburner', count: 1 }],
-        chainBreakdown: [],
-      };
+    const aggregateStats = {
+      totalTokens: BigInt('4000000000000000000000'),
+      currentMa7: null,
+      currentMa30: null,
+      chainBreakdown: [],
+    };
 
-      await slackService.sendTransferAlert(transfer, 1, aggregateStats);
+    it('should send a message when there are burns in the window', async () => {
+      const burns: TokenTransfer[] = [
+        {
+          hash: '0xabc123',
+          blockNumber: 1000,
+          tokenAddress: '0xtoken',
+          from: '0xfrom',
+          to: '0xto',
+          value: BigInt('4000000000000000000000'),
+          timestamp: new Date('2025-01-01T02:00:00Z'),
+          burnerAddress: '0xburner',
+          chain: 'mainnet',
+        },
+      ];
+
+      await slackService.sendDigest(windowStart, windowEnd, burns, aggregateStats);
 
       expect(mockPostMessage).toHaveBeenCalledWith(
         expect.objectContaining({
           channel: mockChannel,
           blocks: expect.any(Array),
+          unfurl_links: false,
+          unfurl_media: false,
         })
       );
+
+      const blocks = mockPostMessage.mock.calls[0][0].blocks;
+      const allText = JSON.stringify(blocks);
+      expect(allText).toContain('UNI Burn Report');
+      expect(allText).toContain('1 burn');
+      expect(allText).toContain('4,000 UNI');
+    });
+
+    it('should send a "no burns" message for an empty window', async () => {
+      await slackService.sendDigest(windowStart, windowEnd, [], aggregateStats);
+
+      expect(mockPostMessage).toHaveBeenCalled();
+      const blocks = mockPostMessage.mock.calls[0][0].blocks;
+      const allText = JSON.stringify(blocks);
+      expect(allText).toContain('No burns in this period');
+    });
+
+    it('should include 7d and 30d MA when available', async () => {
+      await slackService.sendDigest(windowStart, windowEnd, [], {
+        ...aggregateStats,
+        currentMa7: 8000,
+        currentMa30: 6500,
+      });
+
+      const blocks = mockPostMessage.mock.calls[0][0].blocks;
+      const allText = JSON.stringify(blocks);
+      expect(allText).toContain('8,000 UNI/day');
+      expect(allText).toContain('6,500 UNI/day');
+    });
+
+    it('should show per-chain breakdown when multiple chains present', async () => {
+      await slackService.sendDigest(windowStart, windowEnd, [], {
+        ...aggregateStats,
+        chainBreakdown: [
+          { chain: 'mainnet', totalUNI: BigInt('4000000000000000000000'), totalTransactions: 1 },
+          { chain: 'unichain', totalUNI: BigInt('2000000000000000000000'), totalTransactions: 1 },
+        ],
+      });
+
+      const blocks = mockPostMessage.mock.calls[0][0].blocks;
+      const allText = JSON.stringify(blocks);
+      expect(allText).toContain('By Chain');
+      expect(allText).toContain('Mainnet');
+      expect(allText).toContain('Unichain');
     });
   });
 });
-

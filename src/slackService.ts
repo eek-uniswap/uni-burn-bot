@@ -5,13 +5,11 @@ export class SlackService {
   private client: WebClient;
   private channel: string;
   private tokenDecimals: number;
-  private monitoredAmounts: bigint[] = [];
 
   constructor(botToken: string, channel: string, tokenDecimals: number = 18) {
     this.client = new WebClient(botToken);
     this.channel = channel;
     this.tokenDecimals = tokenDecimals;
-    this.monitoredAmounts = [];
     console.log(`Slack service initialized for channel: ${this.channel}`);
   }
 
@@ -42,7 +40,7 @@ export class SlackService {
     return `${wholeFormatted}.${trimmedFractional}`;
   }
 
-  private formatTimeDifference(ms: number): string {
+  formatTimeDifference(ms: number): string {
     const seconds = Math.floor(ms / 1000);
     const minutes = Math.floor(seconds / 60);
     const hours = Math.floor(minutes / 60);
@@ -70,137 +68,116 @@ export class SlackService {
     return explorers[chain ?? 'mainnet'] ?? 'https://etherscan.io';
   }
 
-  private formatTokenTransferMessage(
-    transfer: TokenTransfer,
-    burnerCount: number,
+  private formatWindowLabel(start: Date, end: Date): string {
+    const timeOpts: Intl.DateTimeFormatOptions = { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'UTC' };
+    const dateOpts: Intl.DateTimeFormatOptions = { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' };
+    const startStr = start.toLocaleTimeString('en-US', timeOpts);
+    const endStr = end.toLocaleTimeString('en-US', timeOpts);
+    const dateStr = end.toLocaleDateString('en-US', dateOpts);
+    return `${startStr} – ${endStr} UTC · ${dateStr}`;
+  }
+
+  private formatDigestBlocks(
+    windowStart: Date,
+    windowEnd: Date,
+    burns: TokenTransfer[],
     aggregateStats: {
       totalTokens: bigint;
       currentMa7: number | null;
       currentMa30: number | null;
-      totalBurners: number;
-      topBurners: Array<{ address: string; count: number }>;
       chainBreakdown: Array<{ chain: string; totalUNI: bigint; totalTransactions: number }>;
     }
   ): any[] {
-    const explorer = this.getExplorerUrl(transfer.chain);
-    const txUrl = `${explorer}/tx/${transfer.hash}`;
-    const burnerAddress = transfer.burnerAddress || transfer.from;
-    const burnerUrl = `${explorer}/address/${burnerAddress}`;
-
-    const chainLabel = this.getChainLabel(transfer.chain);
-    const transferAmountFormatted = this.formatTokenAmount(transfer.value);
-
-    // Build message blocks
     const blocks: any[] = [
       {
         type: 'header',
         text: {
           type: 'plain_text',
-          text: ` :unicorn_face: :fire: ${chainLabel} UNI Burn Detected`,
+          text: ':unicorn_face: :fire: UNI Burn Report',
         },
-      },
-      {
-        type: 'divider',
       },
       {
         type: 'section',
         text: {
           type: 'mrkdwn',
-          text: '*📋 Most Recent Transaction*',
+          text: this.formatWindowLabel(windowStart, windowEnd),
         },
       },
-      {
-        type: 'section',
-        fields: [
-          {
-            type: 'mrkdwn',
-            text: `*Amount:*\n${transferAmountFormatted} UNI (${chainLabel})`,
-          },
-          {
-            type: 'mrkdwn',
-            text: `*Burner:*\n<${burnerUrl}|\`${burnerAddress}\`>\n${burnerCount} transaction${burnerCount !== 1 ? 's' : ''}`,
-          },
-          {
-            type: 'mrkdwn',
-            text: `*Transaction Hash:*\n<${txUrl}|\`${transfer.hash.slice(0, 10)}...\`>`,
-          },
-        ],
-      },
+      { type: 'divider' },
     ];
 
-    // Add aggregate statistics
-    blocks.push({
-      type: 'divider',
-    });
+    // Period burns
+    if (burns.length === 0) {
+      blocks.push({
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: '*:clock4: This Period*\nNo burns in this period.',
+        },
+      });
+    } else {
+      const windowTotal = burns.reduce((sum, b) => sum + b.value, BigInt(0));
+      const burnLines = burns.map(b => {
+        const explorer = this.getExplorerUrl(b.chain);
+        const txUrl = `${explorer}/tx/${b.hash}`;
+        const amount = this.formatTokenAmount(b.value);
+        const chain = this.getChainLabel(b.chain);
+        return `• ${amount} UNI (${chain}) — <${txUrl}|\`${b.hash.slice(0, 10)}...\`>`;
+      }).join('\n');
+
+      const countLabel = `${burns.length} burn${burns.length !== 1 ? 's' : ''}`;
+      const totalLabel = `${this.formatTokenAmount(windowTotal)} UNI total`;
+
+      blocks.push({
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `*:clock4: This Period*\n${countLabel} · ${totalLabel}\n\n${burnLines}`,
+        },
+      });
+    }
+
+    blocks.push({ type: 'divider' });
+
+    // All-time stats
+    const totalFormatted = this.formatTokenAmount(aggregateStats.totalTokens);
+    const ma7 = aggregateStats.currentMa7 !== null
+      ? `${Math.round(aggregateStats.currentMa7).toLocaleString('en-US')} UNI/day`
+      : 'N/A';
+    const ma30 = aggregateStats.currentMa30 !== null
+      ? `${Math.round(aggregateStats.currentMa30).toLocaleString('en-US')} UNI/day`
+      : 'N/A';
 
     blocks.push({
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: '*📊 Aggregate Statistics*',
+        text: '*:bar_chart: All-Time*',
       },
     });
-
-    const totalTokensFormatted = this.formatTokenAmount(aggregateStats.totalTokens);
-    const ma7Formatted = aggregateStats.currentMa7 !== null
-      ? `${Math.round(aggregateStats.currentMa7).toLocaleString('en-US')} UNI/day`
-      : 'N/A';
 
     blocks.push({
       type: 'section',
       fields: [
-        {
-          type: 'mrkdwn',
-          text: `*Total UNI Burned:*\n${totalTokensFormatted} UNI`,
-        },
-        {
-          type: 'mrkdwn',
-          text: `*7-Day MA:*\n${ma7Formatted}`,
-        },
-        {
-          type: 'mrkdwn',
-          text: `*30-Day MA:*\n${aggregateStats.currentMa30 !== null ? `${Math.round(aggregateStats.currentMa30).toLocaleString('en-US')} UNI/day` : 'N/A'}`,
-        },
-        {
-          type: 'mrkdwn',
-          text: `*Total Burners (${chainLabel}):*\n${aggregateStats.totalBurners.toLocaleString()}`,
-        },
+        { type: 'mrkdwn', text: `*Total Burned:*\n${totalFormatted} UNI` },
+        { type: 'mrkdwn', text: `*7d MA:*\n${ma7}` },
+        { type: 'mrkdwn', text: `*30d MA:*\n${ma30}` },
       ],
     });
 
-    // Add top 3 burners for this chain
-    if (aggregateStats.topBurners.length > 0) {
-      const topBurnersText = aggregateStats.topBurners
-        .map((burner, index) => {
-          const rankEmoji = index === 0 ? '🥇' : index === 1 ? '🥈' : '🥉';
-          const burnerUrl = `${explorer}/address/${burner.address}`;
-          return `${rankEmoji} <${burnerUrl}|\`${burner.address.slice(0, 10)}...\`> - ${burner.count} burn${burner.count !== 1 ? 's' : ''}`;
-        })
-        .join('\n');
-
-      blocks.push({
-        type: 'section',
-        text: {
-          type: 'mrkdwn',
-          text: `*Top 3 Burners (${chainLabel}):*\n${topBurnersText}`,
-        },
-      });
-    }
-
-    // Add per-chain breakdown
+    // Per-chain breakdown (only if multiple chains)
     if (aggregateStats.chainBreakdown.length > 1) {
       const breakdownText = aggregateStats.chainBreakdown
-        .map(({ chain, totalUNI, totalTransactions }) => {
-          const uni = this.formatTokenAmount(totalUNI);
-          return `*${this.getChainLabel(chain)}:* ${uni} UNI (${totalTransactions.toLocaleString()} burns)`;
-        })
+        .map(({ chain, totalUNI, totalTransactions }) =>
+          `*${this.getChainLabel(chain)}:* ${this.formatTokenAmount(totalUNI)} UNI (${totalTransactions.toLocaleString()} burns)`
+        )
         .join('\n');
 
       blocks.push({
         type: 'section',
         text: {
           type: 'mrkdwn',
-          text: `*🌐 By Chain:*\n${breakdownText}`,
+          text: `*:globe_with_meridians: By Chain:*\n${breakdownText}`,
         },
       });
     }
@@ -213,7 +190,7 @@ export class SlackService {
       const response = await this.client.chat.postMessage({
         channel: this.channel,
         blocks,
-        text: 'New token transfer detected', // Fallback text
+        text: 'UNI Burn Report',
         unfurl_links: false,
         unfurl_media: false,
       });
@@ -225,33 +202,18 @@ export class SlackService {
     }
   }
 
-  private getRankSuffix(rank: number): string {
-    if (rank % 100 >= 11 && rank % 100 <= 13) {
-      return 'th';
-    }
-    switch (rank % 10) {
-      case 1: return 'st';
-      case 2: return 'nd';
-      case 3: return 'rd';
-      default: return 'th';
-    }
-  }
-
-  async sendTransferAlert(
-    transfer: TokenTransfer,
-    burnerCount: number,
+  async sendDigest(
+    windowStart: Date,
+    windowEnd: Date,
+    burns: TokenTransfer[],
     aggregateStats: {
       totalTokens: bigint;
       currentMa7: number | null;
       currentMa30: number | null;
-      totalBurners: number;
-      topBurners: Array<{ address: string; count: number }>;
       chainBreakdown: Array<{ chain: string; totalUNI: bigint; totalTransactions: number }>;
     }
   ): Promise<void> {
-    const blocks = this.formatTokenTransferMessage(transfer, burnerCount, aggregateStats);
+    const blocks = this.formatDigestBlocks(windowStart, windowEnd, burns, aggregateStats);
     await this.sendMessage(blocks);
   }
-
 }
-

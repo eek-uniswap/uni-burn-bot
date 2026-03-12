@@ -120,15 +120,19 @@ async function main(): Promise<void> {
   console.log('Bot started. Monitoring for token transfers...');
   console.log(`Polling interval: ${config.pollInterval} seconds`);
 
-  // Helper: build aggregate stats and send Slack alert for a transfer
-  async function processTransfer(transfer: import('./types').TokenTransfer): Promise<void> {
+  const DIGEST_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
+  // Fire the first digest immediately covering the last 4 hours, then every 4h
+  let lastDigestAt = new Date(Date.now() - DIGEST_INTERVAL_MS);
+
+  // Helper: store a transfer in the database
+  function processTransfer(transfer: import('./types').TokenTransfer): void {
     db.addTransfer(transfer);
     console.log(`Stored transfer: ${transfer.hash} (${transfer.chain ?? 'mainnet'})`);
+  }
 
-    const burnerAddress = transfer.burnerAddress || transfer.from;
-    const burnerStats = db.getBurnerStats(burnerAddress);
-
-    const chain = transfer.chain ?? 'mainnet';
+  // Send a digest covering burns since `since`
+  async function sendDigest(since: Date, now: Date): Promise<void> {
+    const burns = db.getTransfersSince(since);
     const maData = db.getDailyBurnMovingAverages(config.tokenDecimals, 30);
     const currentMa7 = maData.filter(d => d.ma7 !== null).slice(-1)[0]?.ma7 ?? null;
     const currentMa30 = maData.filter(d => d.ma30 !== null).slice(-1)[0]?.ma30 ?? null;
@@ -137,16 +141,14 @@ async function main(): Promise<void> {
       totalTokens: db.getTotalTokensSent(),
       currentMa7,
       currentMa30,
-      totalBurners: db.getTotalBurners(chain),
-      topBurners: db.getTopBurners(3, chain),
       chainBreakdown: db.getChainBreakdown(),
     };
 
     try {
-      await slack.sendTransferAlert(transfer, burnerStats.count, aggregateStats);
-      console.log(`Sent alert for transfer: ${transfer.hash}`);
+      await slack.sendDigest(since, now, burns, aggregateStats);
+      console.log(`Sent digest: ${burns.length} burn(s) in window`);
     } catch (error: any) {
-      console.error(`Failed to send Slack alert:`, error.message);
+      console.error(`Failed to send Slack digest:`, error.message);
     }
   }
 
@@ -173,10 +175,6 @@ async function main(): Promise<void> {
       console.log(`[${chainName}] Found ${transfers.length} historical transfer(s)`);
       for (const t of transfers) {
         if (!db.transferExists(t.hash)) db.addTransfer(t);
-      }
-      if (transfers.length > 0) {
-        const mostRecent = transfers.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime())[0];
-        await processTransfer(mostRecent);
       }
     } catch (error: any) {
       console.error(`[${chainName}] Error during backfill:`, error.message);
@@ -210,7 +208,7 @@ async function main(): Promise<void> {
         console.log(`Found ${allNewTransfers.length} new transfer(s) across all chains`);
         for (const transfer of allNewTransfers) {
           if (!db.transferExists(transfer.hash)) {
-            await processTransfer(transfer);
+            processTransfer(transfer);
           } else {
             console.log(`Transfer already exists: ${transfer.hash}`);
           }
@@ -218,6 +216,12 @@ async function main(): Promise<void> {
       }
     } catch (error: any) {
       console.error(`Error in monitoring loop:`, error.message);
+    }
+
+    const now = new Date();
+    if (now.getTime() - lastDigestAt.getTime() >= DIGEST_INTERVAL_MS) {
+      await sendDigest(lastDigestAt, now);
+      lastDigestAt = now;
     }
 
     await new Promise((resolve) => setTimeout(resolve, config.pollInterval * 1000));
